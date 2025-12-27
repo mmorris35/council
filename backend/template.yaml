@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Council - Legendary Investor AI Agents
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.11
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_PREFIX: !Ref TablePrefix
+        SES_SENDER_EMAIL: !Ref SenderEmail
+        ENVIRONMENT: !Ref Environment
+        LOG_LEVEL: INFO
+
+Parameters:
+  TablePrefix:
+    Type: String
+    Default: council
+  SenderEmail:
+    Type: String
+    Default: noreply@council.example.com
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - production
+
+Resources:
+  # DynamoDB Tables
+  MainTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${TablePrefix}-main
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${TablePrefix}-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${TablePrefix}-web-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  # Lambda Functions
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${TablePrefix}-dashboard
+      CodeUri: src/
+      Handler: api.dashboard.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        GetDashboard:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /dashboard
+            Method: GET
+        GetAgentDetail:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /agents/{agent_id}
+            Method: GET
+
+  PortfolioFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${TablePrefix}-portfolio
+      CodeUri: src/
+      Handler: api.portfolios.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        GetPortfolio:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /portfolios/{portfolio_id}
+            Method: GET
+        ListPortfolios:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /portfolios
+            Method: GET
+
+  AgentRunFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${TablePrefix}-agent-run
+      CodeUri: src/
+      Handler: scheduler.daily_run.handler
+      Timeout: 300
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+        - SESCrudPolicy:
+            IdentityName: !Ref SenderEmail
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 14 ? * MON-FRI *)
+            Description: Run all agents daily on market days
+
+  AlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${TablePrefix}-alerts
+      CodeUri: src/
+      Handler: alerts.ses_client.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+        - SESCrudPolicy:
+            IdentityName: !Ref SenderEmail
+
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${TablePrefix}-auth
+      CodeUri: src/
+      Handler: api.auth.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Register:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /auth/register
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        Profile:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /auth/profile
+            Method: GET
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  MainTableName:
+    Description: DynamoDB Main Table Name
+    Value: !Ref MainTable
